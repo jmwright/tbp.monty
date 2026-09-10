@@ -165,6 +165,13 @@ class EvidenceGraphLM(GraphLM):
             when being added to the overall evidence of a hypothesis. If past_weight
             and present_weight add up to 1, it is used as a weight in np.average to
             keep the evidence in a fixed range.
+        process_off_object: Whether to include off-object percepts when matching.
+            Off-object percepts already reach the learning module; they are
+            excluded from matching because the sensor module sets
+            process_features_in_lm to False whenever on_object is False. Setting
+            this True includes them, making the absence of the object at a
+            location available to matching instead of discarding it. Defaults to
+            False, which reproduces the standard behaviour exactly.
 
     Terminal Condition Attributes:
         object_evidence_threshold: Minimum required evidence for an object to be
@@ -257,6 +264,7 @@ class EvidenceGraphLM(GraphLM):
         gsg: EvidenceGoalGenerator | None = None,
         hypotheses_updater_class: type[HypothesesUpdater] = DefaultHypothesesUpdater,
         hypotheses_updater_args: dict | None = None,
+        process_off_object: bool = False,
         *args,
         **kwargs,
     ) -> None:
@@ -278,6 +286,7 @@ class EvidenceGraphLM(GraphLM):
         self.tolerances = tolerances
         self.feature_evidence_increment = feature_evidence_increment
         self.evidence_threshold_config = evidence_threshold_config
+        self.process_off_object = process_off_object
         self.vote_evidence_threshold = vote_evidence_threshold
         # ------ Weighting Params ------
         self.feature_weights = feature_weights
@@ -376,7 +385,12 @@ class EvidenceGraphLM(GraphLM):
         else:
             logger.debug("we have not moved yet.")
 
-        feature_percepts = [p for p in percepts if p.process_features_in_lm]
+        feature_percepts = [
+            p
+            for p in percepts
+            if p.process_features_in_lm
+            or (self.process_off_object and not p.get_on_object())
+        ]
 
         self._compute_possible_matches(
             ctx, feature_percepts, first_movement_detected=first_movement_detected
