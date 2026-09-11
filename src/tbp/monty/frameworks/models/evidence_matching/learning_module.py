@@ -1387,28 +1387,59 @@ class EvidenceGraphLM(GraphLM):
         stats["symmetry_evidence"] = self.symmetry_evidence
         return stats
 
-    def _off_object_in_model(self, input_channel: str) -> dict[str, float]:
+    def _off_object_in_model(self, input_channel: str) -> dict[str, dict[str, float]]:
         """Fraction of hypotheses with a model node within max_match_distance.
 
         Read-only: no evidence, tracker or sampling effects.
+
+        Three numbers per graph, because one fraction over every hypothesis cannot
+        tell a wrong-pose hypothesis being contradicted - which is the mechanism
+        working - from a leading one being contradicted, which is not.
 
         Args:
             input_channel: Channel whose stored graph is queried.
 
         Returns:
-            Fraction of in-model hypotheses, keyed by graph id.
+            Per graph id: `all` over every hypothesis, `contenders` over those
+            within x_percent_threshold of that graph's best evidence, `best` for
+            its single highest-evidence hypothesis, and that hypothesis's evidence
+            so the leading graph can be identified per step.
         """
-        fractions = {}
+        report = {}
+
         for graph_id in self.get_all_known_object_ids():
             hyps = self._hypotheses.get(graph_id)
             if hyps is None or hyps.count == 0:
                 continue
+
             graph = self.graph_memory.get_graph(graph_id, input_channel)
-            dists = graph.find_nearest_neighbors(
+            dists = np.asarray(graph.find_nearest_neighbors(
                 hyps.locations, num_neighbors=1, return_distance=True
-            )
-            fractions[graph_id] = float(
-                (np.asarray(dists) <= self.max_match_distance).mean()
+            ))
+            in_model = dists <= self.max_match_distance
+
+            # Recomputed here rather than read from self.current_mlh.
+            # _displace_hypotheses moves the hypotheses, but does not recompute
+            # the MLH, so current_mlh["location"] is the one from the last matching
+            # step and is stale by the length of the excursion.
+            best_id = int(np.argmax(hyps.evidence))
+            best_evidence = float(hyps.evidence[best_id])
+
+            # The band _threshold_possible_matches uses to decide which graphs are
+            # still possible, applied within a graph rather than across them. not
+            # the same questions, so it reuses the formula and not the method.
+            band = (
+                hyps.evidence > best_evidence * (1 - self.x_percent_threshold / 100)
+                if best_evidence > 0
+                else np.ones_like(hyps.evidence, dtype=bool)
             )
 
-        return fractions
+            report[graph_id] = {
+                "all": float(in_model.mean()),
+                "contenders": float(in_model[band].mean()),
+                "contender_count": int(band.sum()),
+                "best": float(in_model[best_id]),
+                "best_evidence": best_evidence,
+            }
+
+        return report
