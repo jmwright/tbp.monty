@@ -154,6 +154,7 @@ class ObservationProcessor:
         surface_normal_method=SurfaceNormalMethod.TLS,
         weight_curvature=True,
         is_surface_sm=False,
+        substitute_off_object_depth: bool = False,
     ) -> None:
         """Initializes the ObservationProcessor.
 
@@ -170,6 +171,10 @@ class ObservationProcessor:
             is_surface_sm: Surface SMs do not require that the central pixel is
                 "on object" in order to process the observation (i.e., extract
                 features). Defaults to False.
+            substitute_off_object_depth: Whether to move an off-object percept's
+                location along its ray to the running median on-object depth,
+                rather than leaving it at the depth the void was filled with.
+                Defaults to False, which leaves the location unchanged.
         """
         for feature in features:
             assert feature in self.POSSIBLE_FEATURES, (
@@ -181,6 +186,8 @@ class ObservationProcessor:
         self._sensor_module_id = sensor_module_id
         self._surface_normal_method = surface_normal_method
         self._weight_curvature = weight_curvature
+        self._substitute_off_object_depth = substitute_off_object_depth
+        self._on_object_depths = []
 
     def process(self, observation: SensorObservation) -> Message:
         """Processes observation.
@@ -217,6 +224,15 @@ class ObservationProcessor:
 
         x, y, z, semantic_id = obs_3d[center_id]
         on_object = semantic_id > 0
+        if self._substitute_off_object_depth:
+            d_center = float(depth_feat[center_id])
+            if on_object:
+                self._on_object_depths.append(d_center)
+            elif self._on_object_depths:
+                cam = cam_to_world[:3, 3]
+                scale = float(np.median(self._on_object_depths)) / d_center
+                x, y, z = cam + (np.array([x, y, z]) - cam) * scale
+
         if on_object or (self._is_surface_sm and features["object_coverage"] > 0):
             (
                 features,
@@ -254,6 +270,9 @@ class ObservationProcessor:
         percept._semantic_id = semantic_id
 
         return percept
+
+    def reset(self) -> None:
+        self._on_object_depths = []
 
     def _extract_and_add_features(
         self,
@@ -549,6 +568,7 @@ class CameraSM(SensorModule):
         noise_params: dict[str, Any] | None = None,
         is_surface_sm: bool = False,
         delta_thresholds: dict[str, Any] | None = None,
+        substitute_off_object_depth: bool = False,
     ) -> None:
         """Initialize Sensor Module.
 
@@ -569,6 +589,10 @@ class CameraSM(SensorModule):
                 check whether the current state's features are significantly different
                 from the previous with tolerances set according to `delta_thresholds`.
                 Defaults to None.
+            substitute_off_object_depth: Whether to move an off-object percept's
+                location along its ray to the running median on-object depth,
+                rather than leaving it at the depth the void was filled with.
+                Defaults to False, which leaves the location unchanged.
 
         Note:
             When using feature-at-location matching with graphs, surface_normal and
@@ -583,6 +607,7 @@ class CameraSM(SensorModule):
             sensor_module_id=sensor_module_id,
             pc1_is_pc2_threshold=pc1_is_pc2_threshold,
             is_surface_sm=is_surface_sm,
+            substitute_off_object_depth=substitute_off_object_depth,
         )
         # TODO: With DefaultMessageNoise not getting RNG on init anymore,
         #       then we can initialize CameraSM with MessageNoise, instead
@@ -613,6 +638,7 @@ class CameraSM(SensorModule):
         self._percept_filter.reset()
         self.is_exploring = False
         self.processed_obs = []
+        self._observation_processor.reset()
 
     def update_state(self, agent: AgentState) -> None:
         sensor = agent.sensors[SensorID(self.sensor_module_id)]

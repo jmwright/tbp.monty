@@ -40,6 +40,7 @@ from tbp.monty.frameworks.utils.graph_matching_utils import (
     get_scaled_evidences,
 )
 from tbp.monty.geometry import Rotation
+from tbp.monty.memento import Memento
 from tbp.monty.runtime import is_location_only_step
 
 __all__ = ["EvidenceGraphLM", "InvalidEvidenceThresholdConfig"]
@@ -361,6 +362,11 @@ class EvidenceGraphLM(GraphLM):
             # TODO: could do this in the object model class
             self.graph_memory.initialize_feature_arrays()
 
+    def state_dict(self) -> Memento:
+        memo = dict(super().state_dict())
+        memo["off_object_in_model"] = self.buffer.stats["off_object_in_model"]
+        return memo
+
     def reset_stm(self) -> None:
         super().reset_stm()
         self._init_EvidenceGraphLM()
@@ -373,6 +379,18 @@ class EvidenceGraphLM(GraphLM):
         """Update the possible matches given an observation."""
         if is_location_only_step(percepts):
             self._displace_hypotheses(percepts)
+            if self.process_off_object:
+                off = [p for p in percepts if p.is_from_sm() and not p.get_on_object()]
+                if off:
+                    self.buffer.update_stats(
+                        {
+                            "off_object_in_model": self._off_object_in_model(
+                                off[0].sender_id
+                            )
+                        },
+                        update_time=False,
+                        append=True,
+                    )
             return
 
         first_movement_detected = self._agent_moved_since_reset()
@@ -1368,3 +1386,29 @@ class EvidenceGraphLM(GraphLM):
         }
         stats["symmetry_evidence"] = self.symmetry_evidence
         return stats
+
+    def _off_object_in_model(self, input_channel: str) -> dict[str, float]:
+        """Fraction of hypotheses with a model node within max_match_distance.
+
+        Read-only: no evidence, tracker or sampling effects.
+
+        Args:
+            input_channel: Channel whose stored graph is queried.
+
+        Returns:
+            Fraction of in-model hypotheses, keyed by graph id.
+        """
+        fractions = {}
+        for graph_id in self.get_all_known_object_ids():
+            hyps = self._hypotheses.get(graph_id)
+            if hyps is None or hyps.count == 0:
+                continue
+            graph = self.graph_memory.get_graph(graph_id, input_channel)
+            dists = graph.find_nearest_neighbors(
+                hyps.locations, num_neighbors=1, return_distance=True
+            )
+            fractions[graph_id] = float(
+                (np.asarray(dists) <= self.max_match_distance).mean()
+            )
+
+        return fractions
