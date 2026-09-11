@@ -27,3 +27,13 @@ def all_usable_input_channels(
         All input channels that are usable for matching.
     """
     return [ic for ic in features if ic in all_input_channels]
+
+
+def is_null_channel(channel_features: dict) -> bool:
+    """Whether a channel's percept carried no pose.
+
+    Returns:
+        True for an off-object observation, which has a location but no
+        surface normal, curvature or pose to match against.
+    """
+    return channel_features.get("on_object", 1.0) == 0.0

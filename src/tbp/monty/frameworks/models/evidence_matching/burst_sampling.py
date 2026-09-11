@@ -18,6 +18,7 @@ from typing_extensions import Self
 
 from tbp.monty.frameworks.models.evidence_matching.channels import (
     all_usable_input_channels,
+    is_null_channel,
 )
 from tbp.monty.frameworks.models.evidence_matching.evidence_slope_tracker import (
     EvidenceSlopeTracker,
@@ -138,6 +139,7 @@ class BurstSamplingHypothesesUpdater:
         past_weight: float = 1,
         present_weight: float = 1,
         umbilical_num_poses: int = 8,
+        off_object_contradiction: float = 0.0,
     ):
         """Initializes the BurstSamplingHypothesesUpdater.
 
@@ -197,6 +199,11 @@ class BurstSamplingHypothesesUpdater:
             umbilical_num_poses: Number of sampled rotations in the direction of
                 the plane perpendicular to the surface normal. These are sampled at
                 umbilical points (i.e., points where PC directions are undefined).
+            off_object_contradiction: Evidence subtracted from a hypothesis that
+                is in model at a step where the sensor found no surface - it
+                predicted a surface that is not there. Confirmation is no change
+                rather than positive evidence, so this is the only value the null
+                path applies. Defaults to 0.0, which makes the path inert.
 
         Raises:
             ValueError: If the sampling_multiplier is less than 0
@@ -237,6 +244,7 @@ class BurstSamplingHypothesesUpdater:
             past_weight=past_weight,
             present_weight=present_weight,
             feature_evidence_scorer=self._feature_evidence_scorer,
+            off_object_contradiction=off_object_contradiction,
         )
 
         if self.sampling_multiplier < 0:
@@ -382,9 +390,10 @@ class BurstSamplingHypothesesUpdater:
         hypotheses_update = Hypotheses.concatenate(
             [existing_hypotheses, new_hypotheses]
         )
-        tracker.update(
-            hypotheses_update.evidence, num_channels=len(input_channels_to_use)
-        )
+        if not all(is_null_channel(features[ch]) for ch in input_channels_to_use):
+            tracker.update(
+                hypotheses_update.evidence, num_channels=len(input_channels_to_use)
+            )
 
         if self.include_telemetry:
             telemetry = asdict(
@@ -464,6 +473,10 @@ class BurstSamplingHypothesesUpdater:
             # so we compute per-channel totals to ensure each is divisible
             # by its own num_hyps_per_node.
             for channel in input_channels:
+                if is_null_channel(features[channel]):
+                    new_hypotheses_per_channel[channel] = 0
+                    continue
+
                 num_nodes = self.graph_memory.get_locations_in_graph(
                     graph_id, channel
                 ).shape[0]
@@ -481,14 +494,19 @@ class BurstSamplingHypothesesUpdater:
 
                 new_hypotheses_per_channel[channel] = sample_count
 
-        # Returns a selection of hypotheses to retain/delete
-        hypotheses_selection = (
-            tracker.select_hypotheses(
-                slope_threshold=self.deletion_trigger_slope,
+        if all(is_null_channel(features[ch]) for ch in input_channels):
+            hypotheses_selection = HypothesesSelection(
+                np.ones(tracker.total_size(), dtype=bool)
             )
-            if tracker.total_size() > 0
-            else HypothesesSelection(mask_to_retain=[])
-        )
+        else:
+            # Returns a selection of hypotheses to retain/delete
+            hypotheses_selection = (
+                tracker.select_hypotheses(
+                    slope_threshold=self.deletion_trigger_slope,
+                )
+                if tracker.total_size() > 0
+                else HypothesesSelection(mask_to_retain=[])
+            )
 
         return (
             hypotheses_selection,

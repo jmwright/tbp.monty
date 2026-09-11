@@ -377,20 +377,11 @@ class EvidenceGraphLM(GraphLM):
         percepts: Sequence[Message],
     ) -> None:
         """Update the possible matches given an observation."""
-        if is_location_only_step(percepts):
+        off = [p for p in percepts if p.is_from_sm() and not p.get_on_object()]
+        score_off_object = bool(self.process_off_object and off)
+
+        if is_location_only_step(percepts) and not score_off_object:
             self._displace_hypotheses(percepts)
-            if self.process_off_object:
-                off = [p for p in percepts if p.is_from_sm() and not p.get_on_object()]
-                if off:
-                    self.buffer.update_stats(
-                        {
-                            "off_object_in_model": self._off_object_in_model(
-                                off[0].sender_id
-                            )
-                        },
-                        update_time=False,
-                        append=True,
-                    )
             return
 
         first_movement_detected = self._agent_moved_since_reset()
@@ -413,6 +404,17 @@ class EvidenceGraphLM(GraphLM):
         self._compute_possible_matches(
             ctx, feature_percepts, first_movement_detected=first_movement_detected
         )
+
+        if score_off_object:
+            self.buffer.update_stats(
+                {
+                    "off_object_in_model": self._off_object_in_model(
+                        off[0].sender_id
+                    )
+                },
+                update_time=False,
+                append=True,
+            )
 
         if len(self.get_possible_matches()) == 0:
             self.set_individual_ts(terminal_state="no_match")

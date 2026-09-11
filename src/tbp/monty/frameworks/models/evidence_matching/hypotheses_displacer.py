@@ -18,6 +18,7 @@ import numpy.typing as npt
 
 from tbp.monty.frameworks.models.evidence_matching.channels import (
     all_usable_input_channels,
+    is_null_channel,
 )
 from tbp.monty.frameworks.models.evidence_matching.feature_evidence.scorer import (
     FeatureEvidenceScorer,
@@ -102,6 +103,7 @@ class DefaultHypothesesDisplacer:
         max_nneighbors: int = 3,
         past_weight: float = 1,
         present_weight: float = 1,
+        off_object_contradiction: float = 0.0,
     ):
         """Initializes the DefaultHypothesesDisplacer.
 
@@ -129,6 +131,11 @@ class DefaultHypothesesDisplacer:
                 efficient policy and better parameters that may be possible to use
                 though and could help when moving from one object to another and to
                 generally make setting thresholds etc. more intuitive.
+            off_object_contradiction: Evidence subtracted from a hypothesis that
+                is in model at a step where the sensor found no surface - it
+                predicted a surface that is not there. Confirmation is no change
+                rather than positive evidence, so this is the only value the null
+                path applies. Defaults to 0.0, which makes the path inert.
         """
         self.feature_weights = feature_weights
         self.graph_memory = graph_memory
@@ -136,6 +143,7 @@ class DefaultHypothesesDisplacer:
         self.max_nneighbors = max_nneighbors
         self.past_weight = past_weight
         self.present_weight = present_weight
+        self.off_object_contradiction = off_object_contradiction
         self._feature_evidence_scorer = feature_evidence_scorer
 
     def displace_hypotheses(
@@ -253,6 +261,17 @@ class DefaultHypothesesDisplacer:
         logger.debug(
             f"Calculating evidence for {graph_id} using input from {input_channel}"
         )
+
+        if is_null_channel(channel_features):
+            dists = self.graph_memory.get_graph(
+                graph_id, input_channel
+            ).find_nearest_neighbors(
+                search_locations, num_neighbors=1, return_distance=True
+            )
+            in_model = np.asarray(dists) <= self.max_match_distance
+            # Contradicted where the hypothesis predicts a surface the sensor did
+            # not find. Confirmed as no change, not positive evidence
+            return np.where(in_model, -self.off_object_contradiction, 0.0)
 
         pose_transformed_features = rotate_pose_dependent_features(
             channel_features,
