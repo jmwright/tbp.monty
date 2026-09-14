@@ -258,6 +258,11 @@ class BurstSamplingHypothesesUpdater:
         # Dictionary of slope trackers, one for each graph_id
         self.evidence_slope_trackers: dict[str, EvidenceSlopeTracker] = {}
 
+        # Evidence change withheld from each tracker while the clamp holds, per
+        # graph_id. Parallel to that tracker's index space, so it is only valid
+        # while the null-step guards keep that space fixed.
+        self._withheld_evidence: dict[str, npt.NDArray[np.float64]] = {}
+
     def __enter__(self) -> Self:
         """Enter context manager, runs before updating the hypotheses.
 
@@ -352,6 +357,18 @@ class BurstSamplingHypothesesUpdater:
         if len(input_channels_to_use) == 0:
             return None, {}
 
+        null_step = all(is_null_channel(features[ch]) for ch in input_channels_to_use)
+
+        if not null_step:
+            # Before _sample_count, which prunes on these slopes: the window was
+            # frozen across the excursion, so without this the whole accumulated
+            # change arrives in one slot and reads as a cliff. This is also the last
+            # point at which the tracker's index space still matches what was
+            # withheld. The sampling below reorders it.
+            withheld = self._withheld_evidence.pop(graph_id, None)
+            if withheld is not None:
+                tracker.rebase(withheld)
+
         hypotheses_selection, new_hypotheses_per_channel = self._sample_count(
             features=features,
             graph_id=graph_id,
@@ -374,6 +391,7 @@ class BurstSamplingHypothesesUpdater:
         # The existing hypotheses were already displaced by the LM before sampling, so
         # we only need to compute the evidence here.
         if len(hypotheses_selection.ids_to_retain):
+            evidence_before = existing_hypotheses.evidence.copy()
             existing_hypotheses, displacer_telemetry = (
                 self._hypotheses_displacer.compute_evidence(
                     features=features,
@@ -382,7 +400,9 @@ class BurstSamplingHypothesesUpdater:
                     hypotheses=existing_hypotheses,
                 )
             )
+            evidence_delta = existing_hypotheses.evidence - evidence_before
         else:
+            evidence_delta = None
             displacer_telemetry = HypothesisDisplacerTelemetry(
                 mlh_prediction_error=None
             )
@@ -390,7 +410,16 @@ class BurstSamplingHypothesesUpdater:
         hypotheses_update = Hypotheses.concatenate(
             [existing_hypotheses, new_hypotheses]
         )
-        if not all(is_null_channel(features[ch]) for ch in input_channels_to_use):
+        if null_step:
+            if evidence_delta is not None:
+                # The tracker's window does not move, so this step's change has to be
+                # carried until it does. Otherwise it lands whole in one slot at
+                # re-entry, and reads as a cliff rather than the decline it was.
+                withheld = self._withheld_evidence.get(graph_id)
+                self._withheld_evidence[graph_id] = (
+                    evidence_delta if withheld is None else withheld + evidence_delta
+                )
+        else:
             tracker.update(
                 hypotheses_update.evidence, num_channels=len(input_channels_to_use)
             )

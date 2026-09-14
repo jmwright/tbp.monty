@@ -183,6 +183,22 @@ class EvidenceSlopeTracker:
 
         return HypothesesSelection(mask_to_retain)
 
+    def rebase(self, offset: npt.NDArray[np.float64]) -> None:
+        """Shifts every stored value by a per-hypothesis offset.
+
+        For evidence that changed while the tracker was clamped. Adding the withheld
+        change to the history, rather than subtracting it from the present, is what
+        keeps the next diff equal to that step's own change.
+
+        Raises:
+            ValueError: If the number of offsets doesn't match the number of
+                hypotheses.
+        """
+        if offset.shape[0] != self.total_size():
+            raise ValueError(f"Expected {self.total_size()} offsets, got {len(offset)}")
+
+        self._evidence_buffer += offset[:, None]
+
 
 class HypothesesSelection:
     """Encapsulates the selection of hypotheses to retain or remove.
