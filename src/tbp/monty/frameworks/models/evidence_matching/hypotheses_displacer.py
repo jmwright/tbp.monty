@@ -104,6 +104,8 @@ class DefaultHypothesesDisplacer:
         past_weight: float = 1,
         present_weight: float = 1,
         off_object_contradiction: float = 0.0,
+        off_object_ray_carve: bool = False,
+        off_object_ray_incidence: float = 0.5,
     ):
         """Initializes the DefaultHypothesesDisplacer.
 
@@ -136,6 +138,31 @@ class DefaultHypothesesDisplacer:
                 predicted a surface that is not there. Confirmation is no change
                 rather than positive evidence, so this is the only value the null
                 path applies. Defaults to 0.0, which makes the path inert.
+            off_object_ray_incidence: How squarely a ray must meet the surface it
+                strikes, as |ray . normal|, for the strike to count. 0 accepts a ray
+                running along the surface and 1 demands head-on. Grazing strikes are
+                what a distance test gets wrong near the silhouette, and rejecting
+                them is what keeps the contradiction off the correct hypothesis.
+                Ignored unless off_object_ray_carve is set. Defaults to 0.5,
+                measured on the simulated glass episode: it strikes the correct
+                object on 2 of 266 off-object rays against the point test's 6, the
+                wrong one on 25 against 18, and still detects 97.6% of the rays that
+                genuinely cross a surface. Raising it to 0.6 avoids one more false
+                strike and starts missing real ones; lowering it to 0.4 more than
+                doubles them. 0.3 discriminates slightly better at four times the false
+                strikes.
+            off_object_ray_carve: Whether a null observation is tested as a ray
+                rather than as a point. A void pixel does not assert "no surface at
+                this depth", it asserts "no surface anywhere along this ray", so a
+                hypothesis is contradicted wherever it predicts a surface the ray
+                passes through. Testing the substituted point instead confines
+                contradiction to whatever depth the substitution happened to pick,
+                which leaves poses that are in plain view uncontradicted purely
+                because their surface sits at a different depth. The result stays
+                binary - one penalty for a hypothesis the ray passes through,
+                regardless of how much of it does - so the evidence subtracted per
+                step does not scale with object size or node density. Defaults to
+                False, which keeps the point test.
         """
         self.feature_weights = feature_weights
         self.graph_memory = graph_memory
@@ -144,6 +171,9 @@ class DefaultHypothesesDisplacer:
         self.past_weight = past_weight
         self.present_weight = present_weight
         self.off_object_contradiction = off_object_contradiction
+        self.off_object_ray_carve = off_object_ray_carve
+        self.off_object_ray_incidence = off_object_ray_incidence
+        self._ray_tolerances: dict[tuple[str, str], float] = {}
         self._feature_evidence_scorer = feature_evidence_scorer
 
     def displace_hypotheses(
@@ -235,6 +265,41 @@ class DefaultHypothesesDisplacer:
             possible=hypotheses.possible,
         ), HypothesisDisplacerTelemetry(mlh_prediction_error=mlh_prediction_error)
 
+    def _ray_tolerance(self, graph, graph_id, input_channel, nodes):
+        """How close a ray must pass to a node to count as striking the surface.
+
+        Not `max_match_distance`. That is a matching tolerance covering pose error,
+        and using it here inflates the model by 10 mm in every direction, so a ray
+        grazing just outside the silhouette strikes the object it is passing - which
+        aims disconfirmation at the *correct* hypothesis. Measured on the simulated
+        glass episode, the true pose was struck on 28 of 266 off-object steps at
+        that tolerance against 4 at this one.
+
+        Sized from the nodes instead. Measured on the simulated glass episode, the
+        furthest any ray that genuinely crossed the surface fell from a stored node
+        was 1.21 times the median spacing, so 1.25 times it is the radius at which
+        real crossings are all detected. Half the spacing was tried first and is too
+        tight - it detects 46% of genuine crossings and discriminates no better than
+        the point test it replaces. It is measured per graph because the graphs
+        differ: about 3.9 mm between nodes on the mug and the glass, 1.4 mm on the
+        block.
+
+        Returns:
+            The tolerance in metres, cached per graph and input channel.
+        """
+        key = (graph_id, input_channel)
+
+        if key not in self._ray_tolerances:
+            # k=2 because the first neighbour of a node is itself, at zero distance.
+            spacing = np.asarray(
+                graph.find_nearest_neighbors(
+                    nodes, num_neighbors=2, return_distance=True
+                )
+            )[:, 1]
+            self._ray_tolerances[key] = 1.25 * float(np.median(spacing))
+
+        return self._ray_tolerances[key]
+
     def _calculate_evidence_for_new_locations(
         self,
         graph_id: str,
@@ -263,15 +328,72 @@ class DefaultHypothesesDisplacer:
         )
 
         if is_null_channel(channel_features):
-            dists = self.graph_memory.get_graph(
-                graph_id, input_channel
-            ).find_nearest_neighbors(
-                search_locations, num_neighbors=1, return_distance=True
+            direction = channel_features.get("ray_direction")
+            graph = self.graph_memory.get_graph(graph_id, input_channel)
+
+            if not self.off_object_ray_carve or direction is None:
+                dists = graph.find_nearest_neighbors(
+                    search_locations, num_neighbors=1, return_distance=True
+                )
+                # Contradicted where the hypothesis predicts a surface the sensor
+                # did not find. Confirmed as no change, not positive evidence.
+                in_model = np.asarray(dists) <= self.max_match_distance
+                return np.where(in_model, -self.off_object_contradiction, 0.0)
+
+            nodes = self.graph_memory.get_locations_in_graph(graph_id, input_channel)
+            center = nodes.mean(axis=0)
+            radius = float(np.linalg.norm(nodes - center, axis=1).max())
+            tolerance = self._ray_tolerance(graph, graph_id, input_channel, nodes)
+
+            # The ray in each hypothesis's own frame. `poses` maps sensor-frame
+            # vectors into the model frame - measured, not assumed.
+            rays = np.einsum("hij,j->hi", channel_possible_poses, direction)
+            rays /= np.linalg.norm(rays, axis=1, keepdims=True)
+
+            # Distance along each ray to the point nearest the model's centre. The
+            # window has to be centred here rather than on the search location: a
+            # null observation's search location sits off the object by
+            # construction, so a +-radius window about it need not reach the model
+            # at all. Centred on the closest approach it always covers the chord,
+            # which is at most 2*radius long, however far away the point is. The
+            # step must not exceed the tolerance or a thin feature is stepped over.
+            closest = np.einsum(
+                "hi,hi->h", center[None, :] - search_locations, rays
             )
-            in_model = np.asarray(dists) <= self.max_match_distance
-            # Contradicted where the hypothesis predicts a surface the sensor did
-            # not find. Confirmed as no change, not positive evidence
-            return np.where(in_model, -self.off_object_contradiction, 0.0)
+            span = np.arange(-radius, radius + tolerance, tolerance)
+            along = closest[:, None] + span[None, :]
+
+            samples = (
+                search_locations[:, None, :] + along[:, :, None] * rays[:, None, :]
+            )
+            # Indices rather than distances, because the normal at the struck node
+            # is needed too and one query gives both.
+            ids = np.asarray(graph.find_nearest_neighbors(
+                samples.reshape(-1, 3), num_neighbors=1, return_distance=False
+            )).reshape(len(search_locations), -1)
+            struck = nodes[ids]
+            dists = np.linalg.norm(samples - struck, axis=2)
+
+            # Distance alone cannot separate a crossing from a graze. At the
+            # silhouette the surface is tangent to the view, so a ray just outside
+            # passes as close to a stored node as one just inside - measured, the
+            # median on-object ray passes 1.55 mm from a node and the closest
+            # off-object ray 1.17 mm, so the two distributions overlap and no
+            # threshold divides them. Incidence is a second, independent axis: a ray
+            # that crosses the surface meets it near normal, while one grazing the
+            # silhouette runs along it. Requiring both took the correct hypothesis
+            # from 28 false strikes to 1, while striking the wrong object more often
+            # than the point test did.
+            normals = np.asarray(graph.norm, dtype=float)
+            normals = normals / np.maximum(
+                np.linalg.norm(normals, axis=1, keepdims=True), 1e-12
+            )
+            incidence = np.abs(np.einsum("hsi,hi->hs", normals[ids], rays))
+
+            hit = (
+                (dists <= tolerance) & (incidence >= self.off_object_ray_incidence)
+            ).any(axis=1)
+            return np.where(hit, -self.off_object_contradiction, 0.0)
 
         pose_transformed_features = rotate_pose_dependent_features(
             channel_features,

@@ -1053,7 +1053,7 @@ class GraphLM(LearningModule):
                 # since they are requires for matching.
                 if (
                     feature in self.tolerances[input_channel]
-                    or feature in { "pose_fully_defined", "on_object" }
+                    or feature in { "pose_fully_defined", "on_object", "ray_direction" }
                 ):
                     features_to_use[input_channel][feature] = (
                         percept.morphological_features[feature]

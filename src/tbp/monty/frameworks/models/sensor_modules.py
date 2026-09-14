@@ -224,6 +224,19 @@ class ObservationProcessor:
 
         x, y, z, semantic_id = obs_3d[center_id]
         on_object = semantic_id > 0
+
+        ray_direction = None
+        if not on_object:
+            cam = cam_to_world[:3, 3]
+
+            # The direction of the void pixel's own ray, taken before the depth
+            # substitution slides the point along it. A void asserts "no surface
+            # anywhere on this ray", and the substituted point is just one place
+            # on it - which is the whole reason the point test misses handles at
+            # depths the substitution does not happen to land on.
+            towards = np.array([x, y, z]) - cam
+            ray_direction = towards / np.linalg.norm(towards)
+
         if self._substitute_off_object_depth:
             d_center = float(depth_feat[center_id])
             if on_object:
@@ -254,6 +267,9 @@ class ObservationProcessor:
 
         if "on_object" in self._features:
             morphological_features["on_object"] = float(on_object)
+
+        if ray_direction is not None:
+            morphological_features["ray_direction"] = ray_direction
 
         # Sensor module returns features at a location in the form of a Message class.
         percept = Message(

@@ -125,6 +125,11 @@ def evidence_update_threshold(
 logger = logging.getLogger(__name__)
 
 
+# Thirty-degree bins. Fine enough to separate a handle in view from one behind the
+# body, coarse enough that most bins hold hypotheses on a space of a few hundred.
+AZIMUTH_BINS = 12
+
+
 class EvidenceGraphLM(GraphLM):
     """Learning module that accumulates evidence for objects and poses.
 
@@ -1389,6 +1394,48 @@ class EvidenceGraphLM(GraphLM):
         stats["symmetry_evidence"] = self.symmetry_evidence
         return stats
 
+    def _best_by_azimuth(self, hyps, reduce=np.max) -> npt.NDArray[np.float32]:
+        """Evidence summarised over each azimuth bin of a graph's hypothesis space.
+
+        The single best hypothesis cannot say whether a class of poses is losing or
+        merely not leading. Once a mechanism drives the leader from one pose class to
+        another, the class it left becomes invisible - which is exactly the quantity
+        needed to tell "the falsifiable poses were beaten down" from "the leader
+        moved for some other reason".
+
+        Binned by where the model's own +X axis points in the world, which requires
+        no knowledge of what sits at +X. The reader maps bins onto an object's
+        features offline, where the handle direction is already measured.
+
+        The best alone cannot say whether a bin is unpenalised or merely contains
+        one hypothesis that dodged the observations. Taking the median beside it
+        answers that: a bin carried by a dodger has a best far above its median,
+        while a genuinely unpenalised bin has the two together.
+
+        Args:
+            hyps: The hypothesis space for one graph.
+            reduce: Applied to the evidence in each bin. `len` counts instead.
+
+        Returns:
+            One value per bin, NaN where the bin holds no hypotheses.
+        """
+        # pose.T @ [1, 0, 0] selects the first row of pose.
+        world_x = np.asarray(hyps.poses)[:, 0, :]
+        azimuth = np.degrees(np.arctan2(world_x[:, 2], world_x[:, 0]))
+        bins = np.clip(
+            ((azimuth + 180.0) / (360.0 / AZIMUTH_BINS)).astype(int),
+            0,
+            AZIMUTH_BINS - 1,
+        )
+
+        best = np.full(AZIMUTH_BINS, np.nan, dtype=np.float32)
+        for index in range(AZIMUTH_BINS):
+            in_bin = bins == index
+            if in_bin.any():
+                best[index] = float(reduce(np.asarray(hyps.evidence)[in_bin]))
+
+        return best
+
     def _off_object_in_model(self, input_channel: str) -> dict[str, dict[str, float]]:
         """Fraction of hypotheses with a model node within max_match_distance.
 
@@ -1442,6 +1489,11 @@ class EvidenceGraphLM(GraphLM):
                 "contender_count": int(band.sum()),
                 "best": float(in_model[best_id]),
                 "best_evidence": best_evidence,
+                "best_pose": hyps.poses[best_id].astype(np.float32),
+                "best_location": hyps.locations[best_id].astype(np.float32),
+                "best_by_azimuth": self._best_by_azimuth(hyps),
+                "median_by_azimuth": self._best_by_azimuth(hyps, np.median),
+                "count_by_azimuth": self._best_by_azimuth(hyps, len),
             }
 
         return report

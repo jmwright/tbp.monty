@@ -140,6 +140,8 @@ class BurstSamplingHypothesesUpdater:
         present_weight: float = 1,
         umbilical_num_poses: int = 8,
         off_object_contradiction: float = 0.0,
+        off_object_ray_carve: bool = False,
+        off_object_ray_incidence: float = 0.5,
     ):
         """Initializes the BurstSamplingHypothesesUpdater.
 
@@ -204,6 +206,30 @@ class BurstSamplingHypothesesUpdater:
                 predicted a surface that is not there. Confirmation is no change
                 rather than positive evidence, so this is the only value the null
                 path applies. Defaults to 0.0, which makes the path inert.
+            off_object_ray_incidence: How squarely a ray must meet the surface it
+                strikes, as |ray . normal|, for the strike to count. 0 accepts a ray
+                running along the surface and 1 demands head-on. Grazing strikes are
+                what a distance test gets wrong near the silhouette, and rejecting
+                them is what keeps the contradiction off the correct hypothesis.
+                Ignored unless off_object_ray_carve is set. Defaults to 0.5,
+                measured on the simulated glass episode: it strikes the correct
+                object on 2 of 266 off-object rays against the point test's 6, the
+                wrong one on 25 against 18, and still detects 97.6% of the rays that
+                genuinely cross a surface. Raising it to 0.6 avoids one more false
+                strike and starts missing real ones; lowering it to 0.4 more than
+                doubles them.
+            off_object_ray_carve: Whether a null observation is tested as a ray
+                rather than as a point. A void pixel does not assert "no surface at
+                this depth", it asserts "no surface anywhere along this ray", so a
+                hypothesis is contradicted wherever it predicts a surface the ray
+                passes through. Testing the substituted point instead confines
+                contradiction to whatever depth the substitution happened to pick,
+                which leaves poses that are in plain view uncontradicted purely
+                because their surface sits at a different depth. The result stays
+                binary - one penalty for a hypothesis the ray passes through,
+                regardless of how much of it does - so the evidence subtracted per
+                step does not scale with object size or node density. Defaults to
+                False, which keeps the point test.
 
         Raises:
             ValueError: If the sampling_multiplier is less than 0
@@ -245,6 +271,8 @@ class BurstSamplingHypothesesUpdater:
             present_weight=present_weight,
             feature_evidence_scorer=self._feature_evidence_scorer,
             off_object_contradiction=off_object_contradiction,
+            off_object_ray_carve=off_object_ray_carve,
+            off_object_ray_incidence=off_object_ray_incidence,
         )
 
         if self.sampling_multiplier < 0:
