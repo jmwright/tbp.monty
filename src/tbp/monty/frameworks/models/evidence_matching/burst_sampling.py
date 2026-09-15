@@ -142,6 +142,7 @@ class BurstSamplingHypothesesUpdater:
         off_object_contradiction: float = 0.0,
         off_object_ray_carve: bool = False,
         off_object_ray_incidence: float = 0.5,
+        off_object_coverage_normalised: bool = False,
     ):
         """Initializes the BurstSamplingHypothesesUpdater.
 
@@ -218,6 +219,9 @@ class BurstSamplingHypothesesUpdater:
                 genuinely cross a surface. Raising it to 0.6 avoids one more false
                 strike and starts missing real ones; lowering it to 0.4 more than
                 doubles them.
+            off_object_coverage_normalised: Whether the contradiction is a
+                fraction of the hypothesis's own accumulated evidence rather than
+                a fixed amount. See HypothesesDisplacer. Defaults to False.
             off_object_ray_carve: Whether a null observation is tested as a ray
                 rather than as a point. A void pixel does not assert "no surface at
                 this depth", it asserts "no surface anywhere along this ray", so a
@@ -273,6 +277,7 @@ class BurstSamplingHypothesesUpdater:
             off_object_contradiction=off_object_contradiction,
             off_object_ray_carve=off_object_ray_carve,
             off_object_ray_incidence=off_object_ray_incidence,
+            off_object_coverage_normalised=off_object_coverage_normalised,
         )
 
         if self.sampling_multiplier < 0:

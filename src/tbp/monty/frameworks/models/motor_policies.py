@@ -592,7 +592,15 @@ class JumpToGoal(MotorPolicy):
         target_agent_vec = goal.morphological_features["pose_vectors"][0]
 
         yaw_angle = math.atan2(-target_agent_vec[0], -target_agent_vec[2])
-        pitch_angle = math.asin(target_agent_vec[1])
+        # Clipped because `target_agent_vec` is a stored surface normal rotated into
+        # the world frame, and a stored normal is unit only to floating point: on the
+        # rig library 430 of the mug's 781 nodes carry a magnitude of 1 + eps. On a
+        # horizontal face - the mug's rim, the glass's base - the y component is that
+        # magnitude, so `asin` is handed 1.0000000000000002 and raises
+        # `ValueError: math domain error`, killing the episode. Only reachable once
+        # goals are actually generated, which is why the stock configs never see it:
+        # `min_post_goal_success_steps` defaults to inf and disables them.
+        pitch_angle = math.asin(min(1.0, max(-1.0, target_agent_vec[1])))
 
         # Should rotate by pitch degrees around x, and by yaw degrees around y (and
         # no change about z, which would correspond to roll)
@@ -863,7 +871,15 @@ class InformedPolicy(BasePolicy):
         target_agent_vec = goal.morphological_features["pose_vectors"][0]
 
         yaw_angle = math.atan2(-target_agent_vec[0], -target_agent_vec[2])
-        pitch_angle = math.asin(target_agent_vec[1])
+        # Clipped because `target_agent_vec` is a stored surface normal rotated into
+        # the world frame, and a stored normal is unit only to floating point: on the
+        # rig library 430 of the mug's 781 nodes carry a magnitude of 1 + eps. On a
+        # horizontal face - the mug's rim, the glass's base - the y component is that
+        # magnitude, so `asin` is handed 1.0000000000000002 and raises
+        # `ValueError: math domain error`, killing the episode. Only reachable once
+        # goals are actually generated, which is why the stock configs never see it:
+        # `min_post_goal_success_steps` defaults to inf and disables them.
+        pitch_angle = math.asin(min(1.0, max(-1.0, target_agent_vec[1])))
 
         # Should rotate by pitch degrees around x, and by yaw degrees around y (and
         # no change about z, which would correspond to roll)

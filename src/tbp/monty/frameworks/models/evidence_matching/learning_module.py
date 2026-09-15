@@ -178,6 +178,15 @@ class EvidenceGraphLM(GraphLM):
             this True includes them, making the absence of the object at a
             location available to matching instead of discarding it. Defaults to
             False, which reproduces the standard behaviour exactly.
+        goals_from_off_object: Whether a scored off-object step counts as a step
+            the LM processed. Only meaningful with process_off_object. It decides
+            two things at once, and they have to move together: whether the GSG is
+            asked for its goal on such a step (`propose_goals` gates on
+            `get_last_obs_processed`), and whether the step advances the count the
+            GSG's own schedule is measured in (`elapsed_steps_factor` against
+            `get_num_matching_steps`). Enabling only the first leaves the schedule
+            frozen mid-episode. Defaults to False, which reproduces the standard
+            behaviour exactly - including for a run with process_off_object on.
 
     Terminal Condition Attributes:
         object_evidence_threshold: Minimum required evidence for an object to be
@@ -271,6 +280,7 @@ class EvidenceGraphLM(GraphLM):
         hypotheses_updater_class: type[HypothesesUpdater] = DefaultHypothesesUpdater,
         hypotheses_updater_args: dict | None = None,
         process_off_object: bool = False,
+        goals_from_off_object: bool = False,
         *args,
         **kwargs,
     ) -> None:
@@ -293,6 +303,7 @@ class EvidenceGraphLM(GraphLM):
         self.feature_evidence_increment = feature_evidence_increment
         self.evidence_threshold_config = evidence_threshold_config
         self.process_off_object = process_off_object
+        self.goals_from_off_object = goals_from_off_object
         self.vote_evidence_threshold = vote_evidence_threshold
         # ------ Weighting Params ------
         self.feature_weights = feature_weights
@@ -343,6 +354,7 @@ class EvidenceGraphLM(GraphLM):
 
     def _init_EvidenceGraphLM(self) -> None:  # noqa: N802
         self.symmetry_evidence = 0
+        self._scored_off_object = False
         self._hypotheses = {}
 
         self.hypotheses_updater.reset()  # FIXME: move reset() logic to __init__()
@@ -370,7 +382,78 @@ class EvidenceGraphLM(GraphLM):
     def state_dict(self) -> Memento:
         memo = dict(super().state_dict())
         memo["off_object_in_model"] = self.buffer.stats["off_object_in_model"]
+        memo["goal_trace"] = self._goal_trace()
         return memo
+
+    def _goal_trace(self) -> list[dict]:
+        """One row per output Goal the GSG actually emitted.
+
+        `eval_stats.csv` reduces the whole episode to two integers, attempted and
+        achieved, which cannot say whether a jump aimed at a discriminating feature
+        or at empty space - and that distinction is the entire claim a goal-driven
+        policy makes. The Goal objects themselves are already in the buffer; this
+        keeps the fields that can be checked against a graph offline and drops the
+        rest, because a Goal holds a hypothesis dict with a Rotation in it and
+        pickling those into every run is not worth the size.
+
+        `location` is where the *agent* was sent; `proposed_surface_loc` is the
+        point on the object it was sent to look at. They differ by the surface
+        normal times `desired_object_distance` times 1.5, so comparing the two is
+        also the cheapest check that the standoff is what the config asked for.
+
+        Returns:
+            Per Goal: the matching step it was set on, whether it was achieved, the
+            target and agent locations, and the object and evidence of the
+            hypothesis that proposed it.
+        """
+        goals = self.buffer.stats.get("goal_states") or []
+
+        trace = []
+        for goal in goals:
+            info = goal.info or {}
+            hypothesis = info.get("hypothesis_to_test") or {}
+            trace.append(
+                {
+                    "matching_step": info.get("matching_step_when_output_goal_set"),
+                    "achieved": info.get("achieved"),
+                    "location": np.asarray(goal.location, dtype=np.float32),
+                    "proposed_surface_loc": np.asarray(
+                        info.get("proposed_surface_loc"), dtype=np.float32
+                    ),
+                    "hypothesis_graph_id": hypothesis.get("graph_id"),
+                    "hypothesis_evidence": hypothesis.get("evidence"),
+                    "confidence": goal.confidence,
+                }
+            )
+
+        return trace
+
+    def add_lm_processing_to_buffer_stats(self, lm_processed) -> None:
+        """Record a scored off-object step as a step the LM processed.
+
+        `_step_learning_modules` derives `lm_processed` from
+        `is_location_only_step`, which is true of an off-object percept whatever
+        `process_off_object` says - the sensor module cleared
+        `process_features_in_lm` before the LM ever saw it. So a step this LM
+        really did score reads as a step it skipped.
+
+        Two things downstream read that flag, and stage 6 needs both:
+        `propose_goals` refuses to ask the GSG for its goal, and
+        `get_num_matching_steps` - which the GSG's `elapsed_steps_factor`
+        schedule is counted in - does not advance. Together they mean the spiral,
+        which marches outward and never returns, silently ends goal generation the
+        moment it leaves the object for good. Measured on the bar and the glass:
+        with a ten-fold step budget the on-object step count and the goal count do
+        not move at all, 67/4 and 175/14 either way.
+
+        Off by default, and deliberately not folded into `process_off_object`: it
+        also changes what `increment_evidence` counts for symmetry detection, so
+        turning it on changes the stage 3 to 5 numbers rather than adding to them.
+        """
+        super().add_lm_processing_to_buffer_stats(
+            lm_processed or (self.goals_from_off_object and self._scored_off_object)
+        )
+        self._scored_off_object = False
 
     def reset_stm(self) -> None:
         super().reset_stm()
@@ -384,6 +467,7 @@ class EvidenceGraphLM(GraphLM):
         """Update the possible matches given an observation."""
         off = [p for p in percepts if p.is_from_sm() and not p.get_on_object()]
         score_off_object = bool(self.process_off_object and off)
+        self._scored_off_object = score_off_object
 
         if is_location_only_step(percepts) and not score_off_object:
             self._displace_hypotheses(percepts)
