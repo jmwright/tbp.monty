@@ -505,6 +505,8 @@ class EvidenceGraphLM(GraphLM):
                 append=True,
             )
 
+        self._log_refutation()
+
         if len(self.get_possible_matches()) == 0:
             self.set_individual_ts(terminal_state="no_match")
 
@@ -947,11 +949,61 @@ class EvidenceGraphLM(GraphLM):
         available_graph_evidences = []
         for graph_id in graph_ids:
             evidence = self._hypotheses[graph_id].evidence
+            refuted = self._refuted_hypotheses(graph_id)
+            if refuted is not None:
+                # A refuted hypothesis is not a low-scoring one, it is a dead one.
+                # Taking the max over the survivors is what lets an object leave
+                # possible_matches on disconfirmation alone, however much positive
+                # evidence its best pose accumulated before it was looked through.
+                evidence = evidence[~refuted]
             if len(evidence):
                 available_graph_ids.append(graph_id)
                 available_graph_evidences.append(np.max(evidence))
 
         return available_graph_ids, np.array(available_graph_evidences)
+
+    def _log_refutation(self) -> None:
+        """Log how much of each hypothesis space has been refuted, per step.
+
+        The verdict column says whether an episode terminated; it does not say
+        whether refutation is chewing through the pose space or has stalled against
+        poses no ray can reach. That trajectory is the measurement this mechanism
+        stands or falls on, so it is emitted every matching step, greppable, and
+        only when the mechanism is on.
+        """
+        refuted = getattr(self.hypotheses_updater, "refuted", None)
+        if refuted is None:
+            return
+
+        parts = []
+        for graph_id in self.get_all_known_object_ids():
+            hyps = self._hypotheses.get(graph_id)
+            if hyps is None or hyps.count == 0:
+                continue
+            mask = refuted(graph_id)
+            dead = 0 if mask is None or len(mask) != hyps.count else int(mask.sum())
+            best = self._best_unrefuted_id(graph_id)
+            evidence = "dead" if best is None else f"{hyps.evidence[best]:.3f}"
+            parts.append(f"{graph_id} {dead}/{hyps.count} {evidence}")
+
+        if parts:
+            logger.info("refutation: " + " | ".join(parts))
+
+    def _refuted_hypotheses(self, graph_id: str) -> npt.NDArray[np.bool_] | None:
+        """Which of a graph's hypotheses have been refuted outright, if any.
+
+        Returns:
+            A mask parallel to the graph's evidence array, or None when the
+            updater has no refutation to report or its record has fallen out of
+            step with the hypothesis space. None means refute nothing.
+        """
+        refuted = getattr(self.hypotheses_updater, "refuted", None)
+        if refuted is None:
+            return None
+        mask = refuted(graph_id)
+        if mask is None or len(mask) != len(self._hypotheses[graph_id].evidence):
+            return None
+        return mask if mask.any() else None
 
     # ------------------ Logging & Saving ----------------------
     def collect_stats_to_save(self):
@@ -1396,6 +1448,29 @@ class EvidenceGraphLM(GraphLM):
             "evidence": graph_hyps.evidence[mlh_id],
         }
 
+    def _best_unrefuted_id(self, graph_id: str) -> int | None:
+        """Index of a graph's highest-evidence hypothesis that is not refuted.
+
+        The MLH has to skip refuted hypotheses or the goal generator keeps aiming
+        from a pose that has already been looked through, and the pursuit the
+        mechanism depends on - refute the leader, re-aim at its successor - never
+        advances.
+
+        Returns:
+            The index into the graph's full hypothesis array, or None when the
+            graph has no hypotheses left to lead with.
+        """
+        evidence = self._hypotheses[graph_id].evidence
+        if not len(evidence):
+            return None
+        refuted = self._refuted_hypotheses(graph_id)
+        if refuted is None:
+            return int(np.argmax(evidence))
+        alive = np.flatnonzero(~refuted)
+        if not len(alive):
+            return None
+        return int(alive[np.argmax(evidence[alive])])
+
     def _calculate_most_likely_hypothesis(self, graph_id=None):
         """Return pose with highest evidence count.
 
@@ -1407,17 +1482,15 @@ class EvidenceGraphLM(GraphLM):
         """
         mlh = {}
         if graph_id is not None:
-            graph_evidence = self._hypotheses[graph_id].evidence
-            if len(graph_evidence):
-                mlh_id = np.argmax(graph_evidence)
+            mlh_id = self._best_unrefuted_id(graph_id)
+            if mlh_id is not None:
                 mlh = self._get_mlh_dict_from_id(graph_id, mlh_id)
         else:
             highest_evidence_so_far = -np.inf
             for next_graph_id in self.get_all_known_object_ids():
-                graph_evidence = self._hypotheses[next_graph_id].evidence
-                if len(graph_evidence):
-                    mlh_id = np.argmax(graph_evidence)
-                    evidence = graph_evidence[mlh_id]
+                mlh_id = self._best_unrefuted_id(next_graph_id)
+                if mlh_id is not None:
+                    evidence = self._hypotheses[next_graph_id].evidence[mlh_id]
                     if evidence > highest_evidence_so_far:
                         mlh = self._get_mlh_dict_from_id(next_graph_id, mlh_id)
                         highest_evidence_so_far = evidence

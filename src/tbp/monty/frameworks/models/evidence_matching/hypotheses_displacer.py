@@ -46,6 +46,16 @@ EVIDENCE_RANGE = MAX_EVIDENCE - MIN_EVIDENCE
 @dataclass
 class HypothesisDisplacerTelemetry:
     mlh_prediction_error: float | None
+    """Prediction error of the most likely hypothesis, or None before any movement."""
+
+    off_object_hit: npt.NDArray[np.bool_] | None = None
+    """Which hypotheses this step's null observation passed through, full length.
+
+    None on any step that was not a scored null observation, or when the ray carve
+    is off. Reported rather than applied here because refutation is accumulated
+    across steps, and the index space hypotheses live in is owned by the updater,
+    which resamples it.
+    """
 
 
 class HypothesesDisplacer(Protocol):
@@ -106,7 +116,7 @@ class DefaultHypothesesDisplacer:
         off_object_contradiction: float = 0.0,
         off_object_ray_carve: bool = False,
         off_object_ray_incidence: float = 0.5,
-        off_object_coverage_normalised: bool = False,
+        off_object_refutation_strikes: int = 0,
     ):
         """Initializes the DefaultHypothesesDisplacer.
 
@@ -152,19 +162,6 @@ class DefaultHypothesesDisplacer:
                 strike and starts missing real ones; lowering it to 0.4 more than
                 doubles them. 0.3 discriminates slightly better at four times the false
                 strikes.
-            off_object_coverage_normalised: Whether the contradiction is a
-                fraction of the hypothesis's own accumulated evidence rather than a
-                fixed amount. A constant penalty is additive while positive support
-                is not: on the simulated glass, ~300 on-object observations of a
-                781-node graph swamp the handful that look where the handle should
-                be, and `rig_mug` finishes above the termination band in all twelve
-                azimuth bins by best *and* median. Scaling by the fraction of the
-                hypothesis's own graph that a ray passed through and found empty
-                makes the penalty proportional rather than absolute, so being shown
-                that x% of your predicted surface is missing costs x% of your
-                support however much support you have. Ignored unless
-                off_object_ray_carve is set, which is what supplies the swept nodes.
-                Defaults to False, which reproduces the fixed penalty exactly.
             off_object_ray_carve: Whether a null observation is tested as a ray
                 rather than as a point. A void pixel does not assert "no surface at
                 this depth", it asserts "no surface anywhere along this ray", so a
@@ -187,7 +184,8 @@ class DefaultHypothesesDisplacer:
         self.off_object_contradiction = off_object_contradiction
         self.off_object_ray_carve = off_object_ray_carve
         self.off_object_ray_incidence = off_object_ray_incidence
-        self.off_object_coverage_normalised = off_object_coverage_normalised
+        self.off_object_refutation_strikes = off_object_refutation_strikes
+        self._channel_hit: npt.NDArray[np.bool_] | None = None
         self._ray_tolerances: dict[tuple[str, str], float] = {}
         self._feature_evidence_scorer = feature_evidence_scorer
 
@@ -231,20 +229,31 @@ class DefaultHypothesesDisplacer:
                 features, self.graph_memory.get_input_channels_in_graph(graph_id)
             )
             total_evidence_to_add = np.zeros_like(hypotheses.evidence)
+            step_hit = None
             for channel in input_channels:
+                self._channel_hit = None
                 new_evidence = self._calculate_evidence_for_new_locations(
                     graph_id=graph_id,
                     input_channel=channel,
                     search_locations=search_locations[hyp_idxs_to_test],
                     channel_possible_poses=hypotheses.poses[hyp_idxs_to_test],
                     channel_features=features[channel],
-                    hypothesis_evidence=hypotheses.evidence[hyp_idxs_to_test],
                 )
                 min_update = np.clip(np.min(new_evidence), 0, np.inf)
 
                 channel_evidence = np.ones_like(hypotheses.evidence) * min_update
                 channel_evidence[hyp_idxs_to_test] = new_evidence
                 total_evidence_to_add += channel_evidence
+
+                # Scattered back to the full index space. Hypotheses below the
+                # update threshold were not tested and take no strike - they are
+                # not the leader, and refuting an untested hypothesis would be
+                # asserting something no ray looked at.
+                if self._channel_hit is not None:
+                    if step_hit is None:
+                        step_hit = np.zeros(hypotheses.count, dtype=bool)
+                    step_hit[hyp_idxs_to_test] |= self._channel_hit
+            self._channel_hit = None
 
             # Prediction error from summed evidence
             mlh_index = np.argmax(hypotheses.evidence)
@@ -273,13 +282,17 @@ class DefaultHypothesesDisplacer:
             evidence = hypotheses.evidence
             # If we haven't moved yet, there is no prediction, and thus no error
             mlh_prediction_error = None
+            step_hit = None
 
         return Hypotheses(
             evidence=evidence,
             locations=search_locations,
             poses=hypotheses.poses,
             possible=hypotheses.possible,
-        ), HypothesisDisplacerTelemetry(mlh_prediction_error=mlh_prediction_error)
+        ), HypothesisDisplacerTelemetry(
+            mlh_prediction_error=mlh_prediction_error,
+            off_object_hit=step_hit,
+        )
 
     def _ray_tolerance(self, graph, graph_id, input_channel, nodes):
         """How close a ray must pass to a node to count as striking the surface.
@@ -323,7 +336,6 @@ class DefaultHypothesesDisplacer:
         search_locations: np.ndarray,
         channel_possible_poses: np.ndarray,
         channel_features: dict,
-        hypothesis_evidence: np.ndarray | None = None,
     ):
         """Use search locations, sensed features and graph model to calculate evidence.
 
@@ -412,31 +424,13 @@ class DefaultHypothesesDisplacer:
             )
             hit = struck_here.any(axis=1)
 
-            if not self.off_object_coverage_normalised or hypothesis_evidence is None:
-                return np.where(hit, -self.off_object_contradiction, 0.0)
+            # Reported out through the telemetry rather than acted on here. A strike
+            # is a fact about this step; refutation is a count across steps, and the
+            # index space that count lives in belongs to the updater.
+            if self.off_object_refutation_strikes > 0:
+                self._channel_hit = hit
 
-            # How much of this hypothesis's own model the ray passed through and
-            # found empty, as a fraction of the model. Counted in distinct nodes
-            # rather than samples, because the sample step is the tolerance and a
-            # ray running along a surface would otherwise score a long chord off a
-            # handful of nodes.
-            coverage = np.array(
-                [
-                    len(np.unique(ids[h][struck_here[h]])) / len(nodes)
-                    for h in range(len(search_locations))
-                ]
-            )
-
-            # Proportional, not absolute. `past_weight` and `present_weight` are
-            # both 1 in every config here, so the update is additive and this makes
-            # the step multiplicative: evidence *= (1 - contradiction * coverage).
-            # Clipped at zero so a hypothesis already in negative evidence is not
-            # rewarded for being contradicted, and capped so one observation cannot
-            # invert the sign of the evidence it is scaling.
-            support = np.clip(hypothesis_evidence, 0.0, np.inf)
-            scale = np.clip(self.off_object_contradiction * coverage, 0.0, 1.0)
-
-            return -support * scale
+            return np.where(hit, -self.off_object_contradiction, 0.0)
 
         pose_transformed_features = rotate_pose_dependent_features(
             channel_features,

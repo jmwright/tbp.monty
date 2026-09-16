@@ -142,7 +142,7 @@ class BurstSamplingHypothesesUpdater:
         off_object_contradiction: float = 0.0,
         off_object_ray_carve: bool = False,
         off_object_ray_incidence: float = 0.5,
-        off_object_coverage_normalised: bool = False,
+        off_object_refutation_strikes: int = 0,
     ):
         """Initializes the BurstSamplingHypothesesUpdater.
 
@@ -219,9 +219,6 @@ class BurstSamplingHypothesesUpdater:
                 genuinely cross a surface. Raising it to 0.6 avoids one more false
                 strike and starts missing real ones; lowering it to 0.4 more than
                 doubles them.
-            off_object_coverage_normalised: Whether the contradiction is a
-                fraction of the hypothesis's own accumulated evidence rather than
-                a fixed amount. See HypothesesDisplacer. Defaults to False.
             off_object_ray_carve: Whether a null observation is tested as a ray
                 rather than as a point. A void pixel does not assert "no surface at
                 this depth", it asserts "no surface anywhere along this ray", so a
@@ -234,6 +231,19 @@ class BurstSamplingHypothesesUpdater:
                 regardless of how much of it does - so the evidence subtracted per
                 step does not scale with object size or node density. Defaults to
                 False, which keeps the point test.
+            off_object_refutation_strikes: How many null observations must pass
+                through a hypothesis before it is refuted outright rather than
+                penalised. 0 leaves the path inert. See HypothesesDisplacer for why
+                the operator matters more than the magnitude, and for the risk.
+
+                The count is kept here rather than in the displacer because this
+                updater resamples the hypothesis space every step: hypotheses below
+                the deletion slope are dropped and new ones are appended, so index
+                identity only survives if it is carried through the same
+                permutation the evidence array takes. A hypothesis that is deleted
+                and later resampled near the same pose starts again at zero
+                strikes, which is not a bug to be fixed but the near-tie
+                regeneration the mechanism is being tested against.
 
         Raises:
             ValueError: If the sampling_multiplier is less than 0
@@ -277,8 +287,9 @@ class BurstSamplingHypothesesUpdater:
             off_object_contradiction=off_object_contradiction,
             off_object_ray_carve=off_object_ray_carve,
             off_object_ray_incidence=off_object_ray_incidence,
-            off_object_coverage_normalised=off_object_coverage_normalised,
+            off_object_refutation_strikes=off_object_refutation_strikes,
         )
+        self.off_object_refutation_strikes = off_object_refutation_strikes
 
         if self.sampling_multiplier < 0:
             raise ValueError("sampling_multiplier should be >= 0")
@@ -295,6 +306,11 @@ class BurstSamplingHypothesesUpdater:
         # graph_id. Parallel to that tracker's index space, so it is only valid
         # while the null-step guards keep that space fixed.
         self._withheld_evidence: dict[str, npt.NDArray[np.float64]] = {}
+
+        # Null observations that have passed through each hypothesis, per graph_id.
+        # Parallel to that graph's hypothesis array and carried through every
+        # resampling, so it means the same thing at index i that evidence[i] does.
+        self._strikes: dict[str, npt.NDArray[np.int_]] = {}
 
     def __enter__(self) -> Self:
         """Enter context manager, runs before updating the hypotheses.
@@ -414,6 +430,14 @@ class BurstSamplingHypothesesUpdater:
             hypotheses=hypotheses,
             tracker=tracker,
         )
+        # Same permutation the evidence array just took, so index i keeps meaning
+        # the same hypothesis. Rebuilt from zero whenever the length disagrees,
+        # which covers the first step and any path that rebuilds the space.
+        strikes = self._strikes.get(graph_id)
+        if strikes is None or len(strikes) != hypotheses.count:
+            strikes = np.zeros(hypotheses.count, dtype=np.int_)
+        strikes = strikes[hypotheses_selection.ids_to_retain]
+
         new_hypotheses = self._sample_new_hypotheses(
             features=features,
             graph_id=graph_id,
@@ -434,6 +458,13 @@ class BurstSamplingHypothesesUpdater:
                 )
             )
             evidence_delta = existing_hypotheses.evidence - evidence_before
+
+            # A strike is only recorded for a hypothesis the ray actually passed
+            # through. The displacer reports the mask; the count lives here because
+            # only this class knows how the index space moves.
+            hit = displacer_telemetry.off_object_hit
+            if hit is not None and len(hit) == len(strikes):
+                strikes = strikes + hit
         else:
             evidence_delta = None
             displacer_telemetry = HypothesisDisplacerTelemetry(
@@ -442,6 +473,10 @@ class BurstSamplingHypothesesUpdater:
 
         hypotheses_update = Hypotheses.concatenate(
             [existing_hypotheses, new_hypotheses]
+        )
+        # Freshly sampled hypotheses have not been looked through yet.
+        self._strikes[graph_id] = np.concatenate(
+            [strikes, np.zeros(new_hypotheses.count, dtype=np.int_)]
         )
         if null_step:
             if evidence_delta is not None:
@@ -574,6 +609,27 @@ class BurstSamplingHypothesesUpdater:
             hypotheses_selection,
             new_hypotheses_per_channel,
         )
+
+    def refuted(self, graph_id: str) -> npt.NDArray[np.bool_] | None:
+        """Which hypotheses of a graph have been refuted outright.
+
+        A hypothesis is refuted once `off_object_refutation_strikes` null
+        observations have passed through the volume it says is solid. This is a
+        kill, not a penalty: no amount of accumulated positive evidence brings it
+        back, which is the whole point of the mechanism.
+
+        Returns:
+            A boolean mask parallel to the graph's hypothesis array, or None when
+            the mechanism is off or the graph has no strike record yet. None means
+            "refute nothing", so callers can treat it as all-False without
+            allocating.
+        """
+        if self.off_object_refutation_strikes <= 0:
+            return None
+        strikes = self._strikes.get(graph_id)
+        if strikes is None:
+            return None
+        return strikes >= self.off_object_refutation_strikes
 
     def _sample_existing_hypotheses(
         self,
