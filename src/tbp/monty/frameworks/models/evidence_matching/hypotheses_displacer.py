@@ -185,7 +185,6 @@ class DefaultHypothesesDisplacer:
         self.off_object_ray_carve = off_object_ray_carve
         self.off_object_ray_incidence = off_object_ray_incidence
         self.off_object_refutation_strikes = off_object_refutation_strikes
-        self._channel_hit: npt.NDArray[np.bool_] | None = None
         self._ray_tolerances: dict[tuple[str, str], float] = {}
         self._feature_evidence_scorer = feature_evidence_scorer
 
@@ -231,13 +230,19 @@ class DefaultHypothesesDisplacer:
             total_evidence_to_add = np.zeros_like(hypotheses.evidence)
             step_hit = None
             for channel in input_channels:
-                self._channel_hit = None
+                # A fresh list per call, so nothing is shared between the threads
+                # `_update_evidence` runs one of per graph_id against this same
+                # displacer instance.
+                hit_out: list[npt.NDArray[np.bool_]] | None = (
+                    [] if self.off_object_refutation_strikes > 0 else None
+                )
                 new_evidence = self._calculate_evidence_for_new_locations(
                     graph_id=graph_id,
                     input_channel=channel,
                     search_locations=search_locations[hyp_idxs_to_test],
                     channel_possible_poses=hypotheses.poses[hyp_idxs_to_test],
                     channel_features=features[channel],
+                    hit_out=hit_out,
                 )
                 min_update = np.clip(np.min(new_evidence), 0, np.inf)
 
@@ -249,11 +254,10 @@ class DefaultHypothesesDisplacer:
                 # update threshold were not tested and take no strike - they are
                 # not the leader, and refuting an untested hypothesis would be
                 # asserting something no ray looked at.
-                if self._channel_hit is not None:
+                if hit_out:
                     if step_hit is None:
                         step_hit = np.zeros(hypotheses.count, dtype=bool)
-                    step_hit[hyp_idxs_to_test] |= self._channel_hit
-            self._channel_hit = None
+                    step_hit[hyp_idxs_to_test] |= hit_out[0]
 
             # Prediction error from summed evidence
             mlh_index = np.argmax(hypotheses.evidence)
@@ -336,6 +340,7 @@ class DefaultHypothesesDisplacer:
         search_locations: np.ndarray,
         channel_possible_poses: np.ndarray,
         channel_features: dict,
+        hit_out: list[npt.NDArray[np.bool_]] | None = None,
     ):
         """Use search locations, sensed features and graph model to calculate evidence.
 
@@ -348,6 +353,13 @@ class DefaultHypothesesDisplacer:
 
         We do this for every incoming input channel and its features if they are stored
         in the graph and take the average over the evidence from all input channels.
+
+        Args:
+            hit_out: If given, the ray-carve path appends this step's strike mask to
+                it - which hypotheses the null ray passed through. A caller-owned
+                list rather than an attribute on self, because `_update_evidence`
+                runs one thread per graph_id against a single shared displacer, and
+                an attribute would let one graph read another's mask. None skips it.
 
         Returns:
             The location evidence.
@@ -427,8 +439,8 @@ class DefaultHypothesesDisplacer:
             # Reported out through the telemetry rather than acted on here. A strike
             # is a fact about this step; refutation is a count across steps, and the
             # index space that count lives in belongs to the updater.
-            if self.off_object_refutation_strikes > 0:
-                self._channel_hit = hit
+            if hit_out is not None:
+                hit_out.append(hit)
 
             return np.where(hit, -self.off_object_contradiction, 0.0)
 

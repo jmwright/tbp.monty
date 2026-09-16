@@ -356,6 +356,7 @@ class EvidenceGraphLM(GraphLM):
         self.symmetry_evidence = 0
         self._scored_off_object = False
         self._hypotheses = {}
+        self._refutation_warnings: set[str] = set()
 
         self.hypotheses_updater.reset()  # FIXME: move reset() logic to __init__()
 
@@ -1001,7 +1002,19 @@ class EvidenceGraphLM(GraphLM):
         if refuted is None:
             return None
         mask = refuted(graph_id)
-        if mask is None or len(mask) != len(self._hypotheses[graph_id].evidence):
+        if mask is None:
+            return None
+        expected = len(self._hypotheses[graph_id].evidence)
+        if len(mask) != expected:
+            # Ignoring the mask fails safe to refuting nothing, which is right and
+            # silent - it looks exactly like a mechanism that had no effect. Warn
+            # once per graph so the two can be told apart.
+            if graph_id not in self._refutation_warnings:
+                self._refutation_warnings.add(graph_id)
+                logger.warning(
+                    f"refutation ignored for {graph_id}: mask is {len(mask)} long "
+                    f"against {expected} hypotheses"
+                )
             return None
         return mask if mask.any() else None
 

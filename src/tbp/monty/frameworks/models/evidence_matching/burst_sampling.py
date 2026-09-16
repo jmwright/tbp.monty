@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from dataclasses import asdict, dataclass
 from typing import Any, Literal
 
@@ -56,6 +58,9 @@ from tbp.monty.frameworks.utils.graph_matching_utils import (
 from tbp.monty.frameworks.utils.spatial_arithmetics import (
     align_multiple_orthonormal_vectors,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -312,6 +317,10 @@ class BurstSamplingHypothesesUpdater:
         # resampling, so it means the same thing at index i that evidence[i] does.
         self._strikes: dict[str, npt.NDArray[np.int_]] = {}
 
+        # Graphs already warned about a desynchronised strike record, so a fault
+        # that repeats every step reports once rather than thousands of times.
+        self._strike_warnings: set[str] = set()
+
     def __enter__(self) -> Self:
         """Enter context manager, runs before updating the hypotheses.
 
@@ -434,7 +443,17 @@ class BurstSamplingHypothesesUpdater:
         # the same hypothesis. Rebuilt from zero whenever the length disagrees,
         # which covers the first step and any path that rebuilds the space.
         strikes = self._strikes.get(graph_id)
-        if strikes is None or len(strikes) != hypotheses.count:
+        if strikes is not None and len(strikes) != hypotheses.count:
+            # Falling back to zeros forgets every refutation for this graph, which
+            # reads downstream as "the mechanism did nothing" rather than as a
+            # fault. Say so, once.
+            self._warn_strikes(
+                graph_id,
+                f"strike record is {len(strikes)} long against "
+                f"{hypotheses.count} hypotheses; refutations so far are discarded",
+            )
+            strikes = None
+        if strikes is None:
             strikes = np.zeros(hypotheses.count, dtype=np.int_)
         strikes = strikes[hypotheses_selection.ids_to_retain]
 
@@ -462,8 +481,18 @@ class BurstSamplingHypothesesUpdater:
             # A strike is only recorded for a hypothesis the ray actually passed
             # through. The displacer reports the mask; the count lives here because
             # only this class knows how the index space moves.
+            # isinstance rather than `is not None`: a mocked displacer hands back
+            # a Mock for every attribute, and len() on one raises.
             hit = displacer_telemetry.off_object_hit
-            if hit is not None and len(hit) == len(strikes):
+            if not isinstance(hit, np.ndarray):
+                hit = None
+            if hit is not None and len(hit) != len(strikes):
+                self._warn_strikes(
+                    graph_id,
+                    f"strike mask is {len(hit)} long against {len(strikes)} "
+                    "hypotheses; this step's refutations are dropped",
+                )
+            elif hit is not None:
                 strikes = strikes + hit
         else:
             evidence_delta = None
@@ -609,6 +638,19 @@ class BurstSamplingHypothesesUpdater:
             hypotheses_selection,
             new_hypotheses_per_channel,
         )
+
+    def _warn_strikes(self, graph_id: str, message: str) -> None:
+        """Warn once per graph that refutation bookkeeping has gone out of step.
+
+        Every guard on the strike arrays fails safe to refuting nothing, which is
+        the right direction and an invisible one - a desync looks exactly like a
+        mechanism that had no effect. These are the only places that distinguish
+        the two.
+        """
+        if graph_id in self._strike_warnings:
+            return
+        self._strike_warnings.add(graph_id)
+        logger.warning(f"refutation disabled for {graph_id}: {message}")
 
     def refuted(self, graph_id: str) -> npt.NDArray[np.bool_] | None:
         """Which hypotheses of a graph have been refuted outright.
